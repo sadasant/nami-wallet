@@ -15,7 +15,6 @@ import {
 } from '../../config/config';
 import { POPUP_WINDOW } from '../../config/config';
 import { mnemonicToEntropy } from 'bip39';
-import cryptoRandomString from 'crypto-random-string';
 import Loader from '../loader';
 import { createAvatar } from '@dicebear/avatars';
 import * as style from '@dicebear/avatars-bottts-sprites';
@@ -25,8 +24,6 @@ import {
   networkNameToId,
   utxoFromJson,
   assetsToValue,
-  valueToAssets,
-  sumUtxos,
   txToLedger,
   txToTrezor,
   linkToSrc,
@@ -37,74 +34,18 @@ import Ada, { HARDENED } from '@cardano-foundation/ledgerjs-hw-app-cardano';
 import TrezorConnect from '../../../temporary_modules/trezor-connect';
 import AssetFingerprint from '@emurgo/cip14-js';
 
-export const getStorage = (key) =>
-  new Promise((res, rej) =>
-    chrome.storage.local.get(key, (result) => {
-      if (chrome.runtime.lastError) rej(undefined);
-      res(key ? result[key] : result);
-    })
-  );
-export const setStorage = (item) =>
-  new Promise((res, rej) =>
-    chrome.storage.local.set(item, () => {
-      if (chrome.runtime.lastError) rej(chrome.runtime.lastError);
-      res(true);
-    })
-  );
+import { getStorage, setStorage } from './storage';
+import {
+  getWhitelisted,
+  isWhitelisted,
+  setWhitelisted,
+  removeWhitelisted,
+} from './whitelisted';
+import { encryptWithPassword, decryptWithPassword } from './withPassword';
 
-export const encryptWithPassword = async (password, rootKeyBytes) => {
-  await Loader.load();
-  const rootKeyHex = Buffer.from(rootKeyBytes, 'hex').toString('hex');
-  const passwordHex = Buffer.from(password).toString('hex');
-  const salt = cryptoRandomString({ length: 2 * 32 });
-  const nonce = cryptoRandomString({ length: 2 * 12 });
-  return Loader.Cardano.encrypt_with_password(
-    passwordHex,
-    salt,
-    nonce,
-    rootKeyHex
-  );
-};
-
-export const decryptWithPassword = async (password, encryptedKeyHex) => {
-  await Loader.load();
-  const passwordHex = Buffer.from(password).toString('hex');
-  let decryptedHex;
-  try {
-    decryptedHex = Loader.Cardano.decrypt_with_password(
-      passwordHex,
-      encryptedKeyHex
-    );
-  } catch (err) {
-    throw new Error(ERROR.wrongPassword);
-  }
-  return decryptedHex;
-};
-
-export const getWhitelisted = async () => {
-  const result = await getStorage(STORAGE.whitelisted);
-  return result ? result : [];
-};
-
-export const isWhitelisted = async (_origin) => {
-  const whitelisted = await getWhitelisted();
-  let access = false;
-  if (whitelisted.includes(_origin)) access = true;
-  return access;
-};
-
-export const setWhitelisted = async (origin) => {
-  let whitelisted = await getWhitelisted();
-  whitelisted ? whitelisted.push(origin) : (whitelisted = [origin]);
-  return await setStorage({ [STORAGE.whitelisted]: whitelisted });
-};
-
-export const removeWhitelisted = async (origin) => {
-  const whitelisted = await getWhitelisted();
-  const index = whitelisted.indexOf(origin);
-  whitelisted.splice(index, 1);
-  return await setStorage({ [STORAGE.whitelisted]: whitelisted });
-};
+export { getStorage, setStorage };
+export { getWhitelisted, isWhitelisted, setWhitelisted, removeWhitelisted };
+export { encryptWithPassword, decryptWithPassword };
 
 export const getCurrency = () => getStorage(STORAGE.currency);
 
@@ -130,65 +71,6 @@ export const getDelegation = async () => {
     description: delegation.description,
     name: delegation.name,
   };
-};
-
-export const getBalance = async () => {
-  await Loader.load();
-  const currentAccount = await getCurrentAccount();
-  const result = await blockfrostRequest(
-    `/addresses/${currentAccount.paymentAddr}`
-  );
-  if (result.error) {
-    if (result.status_code === 400) throw APIError.InvalidRequest;
-    else if (result.status_code === 500) throw APIError.InternalError;
-    else return Loader.Cardano.Value.new(Loader.Cardano.BigNum.from_str('0'));
-  }
-  const value = await assetsToValue(result.amount);
-  return value;
-};
-
-export const getBalanceExtended = async () => {
-  const currentAccount = await getCurrentAccount();
-  const result = await blockfrostRequest(
-    `/addresses/${currentAccount.paymentAddr}/extended`
-  );
-  if (result.error) {
-    if (result.status_code === 400) throw APIError.InvalidRequest;
-    else if (result.status_code === 500) throw APIError.InternalError;
-    else return [];
-  }
-  return result.amount;
-};
-
-export const getFullBalance = async () => {
-  const currentAccount = await getCurrentAccount();
-  const result = await blockfrostRequest(
-    `/accounts/${currentAccount.rewardAddr}`
-  );
-  if (result.error) return '0';
-  return (
-    BigInt(result.controlled_amount) - BigInt(result.withdrawable_amount)
-  ).toString();
-};
-
-export const setBalanceWarning = async () => {
-  const currentAccount = await getCurrentAccount();
-  const network = await getNetwork();
-  let warning = { active: false, fullBalance: '0' };
-
-  const result = await blockfrostRequest(
-    `/accounts/${currentAccount.rewardAddr}/addresses?count=2`
-  );
-
-  if (result.length > 1) {
-    const fullBalance = await getFullBalance();
-    if (fullBalance !== currentAccount[network.id].lovelace) {
-      warning.active = true;
-      warning.fullBalance = fullBalance;
-    }
-  }
-
-  return warning;
 };
 
 export const getTransactions = async (paginate = 1, count = 10) => {
@@ -407,109 +289,6 @@ export const getRewardAddress = async () => {
     'hex'
   ).toString('hex');
   return rewardAddr;
-};
-
-export const getCurrentAccountIndex = () => getStorage(STORAGE.currentAccount);
-
-export const getNetwork = () => getStorage(STORAGE.network);
-
-export const setNetwork = async (network) => {
-  const currentNetwork = await getNetwork();
-  let id;
-  let node;
-  if (network.id === NETWORK_ID.mainnet) {
-    id = NETWORK_ID.mainnet;
-    node = NODE.mainnet;
-  } else {
-    id = NETWORK_ID.testnet;
-    node = NODE.testnet;
-  }
-  if (network.node) node = network.node;
-  if (currentNetwork && currentNetwork.id !== id)
-    emitNetworkChange(networkNameToId(id));
-  await setStorage({
-    [STORAGE.network]: { id, node },
-  });
-  return true;
-};
-
-const accountToNetworkSpecific = async (account, network) => {
-  await Loader.load();
-  const paymentKeyHash = Loader.Cardano.Ed25519KeyHash.from_bytes(
-    Buffer.from(account.paymentKeyHash, 'hex')
-  );
-  const stakeKeyHash = Loader.Cardano.Ed25519KeyHash.from_bytes(
-    Buffer.from(account.stakeKeyHash, 'hex')
-  );
-  const paymentAddr = Loader.Cardano.BaseAddress.new(
-    network.id === NETWORK_ID.mainnet
-      ? Loader.Cardano.NetworkInfo.mainnet().network_id()
-      : Loader.Cardano.NetworkInfo.testnet().network_id(),
-    Loader.Cardano.StakeCredential.from_keyhash(paymentKeyHash),
-    Loader.Cardano.StakeCredential.from_keyhash(stakeKeyHash)
-  )
-    .to_address()
-    .to_bech32();
-
-  const rewardAddr = Loader.Cardano.RewardAddress.new(
-    network.id === NETWORK_ID.mainnet
-      ? Loader.Cardano.NetworkInfo.mainnet().network_id()
-      : Loader.Cardano.NetworkInfo.testnet().network_id(),
-    Loader.Cardano.StakeCredential.from_keyhash(stakeKeyHash)
-  )
-    .to_address()
-    .to_bech32();
-
-  const assets = account[network.id].assets;
-  const lovelace = account[network.id].lovelace;
-  const history = account[network.id].history;
-  const minAda = account[network.id].minAda;
-  const collateral = account[network.id].collateral;
-  const recentSendToAddresses = account[network.id].recentSendToAddresses;
-
-  return {
-    ...account,
-    paymentAddr,
-    rewardAddr,
-    assets,
-    lovelace,
-    minAda,
-    collateral,
-    history,
-    recentSendToAddresses,
-  };
-};
-
-/** Returns account with network specific settings (e.g. address, reward address, etc.) */
-export const getCurrentAccount = async () => {
-  const currentAccountIndex = await getCurrentAccountIndex();
-  const accounts = await getStorage(STORAGE.accounts);
-  const network = await getNetwork();
-  return await accountToNetworkSpecific(accounts[currentAccountIndex], network);
-};
-
-/** Returns accounts with network specific settings (e.g. address, reward address, etc.) */
-export const getAccounts = async () => {
-  const accounts = await getStorage(STORAGE.accounts);
-  const network = await getNetwork();
-  for (const index in accounts) {
-    accounts[index] = await accountToNetworkSpecific(accounts[index], network);
-  }
-  return accounts;
-};
-
-export const setAccountName = async (name) => {
-  const currentAccountIndex = await getCurrentAccountIndex();
-  const accounts = await getStorage(STORAGE.accounts);
-  accounts[currentAccountIndex].name = name;
-  return await setStorage({ [STORAGE.accounts]: accounts });
-};
-
-export const setAccountAvatar = async (avatar) => {
-  const currentAccountIndex = await getCurrentAccountIndex();
-  const accounts = await getStorage(STORAGE.accounts);
-  accounts[currentAccountIndex].avatar = avatar;
-  return await setStorage({ [STORAGE.accounts]: accounts });
 };
 
 export const createPopup = (popup) =>
@@ -929,20 +708,6 @@ export const submitTx = async (tx) => {
     else throw APIError.InvalidRequest;
   }
   return result;
-};
-
-const emitNetworkChange = async (networkId) => {
-  //to webpage
-  chrome.tabs.query({}, (tabs) => {
-    tabs.forEach((tab) =>
-      chrome.tabs.sendMessage(tab.id, {
-        data: networkId,
-        target: TARGET,
-        sender: SENDER.extension,
-        event: EVENT.networkChange,
-      })
-    );
-  });
 };
 
 const emitAccountChange = async (addresses) => {
